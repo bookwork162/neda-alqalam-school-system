@@ -63,3 +63,4 @@ Caddyfile
 mini-services
 db/*.db*
 *.tar
+/tool-results
