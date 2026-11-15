@@ -1,0 +1,642 @@
+  1031→  await audit(user.id, "marks", "Exam", id, { saved });
+  1032→  return json({ saved });
+  1033→}
+  1034→
+  1035→async function examCompute(user: AuthUser, id: string): Promise<NextResponse> {
+  1036→  const exam = await db.exam.findUnique({ where: { id } });
+  1037→  if (!exam) return err("not found", 404);
+  1038→  const classroom = await db.classroom.findUnique({ where: { id: exam.classroomId } });
+  1039→  if (!classroom) return err("صنف پیدا نشد", 404);
+  1040→
+  1041→  const classSubjects = await db.classSubject.findMany({ where: { classroomId: classroom.id } });
+  1042→  const subjectIds = classSubjects.map((cs) => cs.subjectId);
+  1043→
+  1044→  // All exams of this classroom contribute their marks to the annual total.
+  1045→  const exams = await db.exam.findMany({
+  1046→    where: { classroomId: classroom.id, academicYearId: classroom.academicYearId },
+  1047→    select: { id: true },
+  1048→  });
+  1049→  const examIds = exams.map((e) => e.id);
+  1050→  const allMarks = examIds.length > 0 ? await db.examMark.findMany({ where: { examId: { in: examIds } } }) : [];
+  1051→
+  1052→  const enrollments = await db.enrollment.findMany({
+  1053→    where: { classroomId: classroom.id, status: "active" },
+  1054→  });
+  1055→  const rules = await getMoeRules();
+  1056→  // Finalize promotion status only when the annual (سالانه) exam has been held.
+  1057→  const annualHeld = (
+  1058→    await db.exam.findFirst({
+  1059→      where: { classroomId: classroom.id, type: "سالانه", status: "برگزارشده" },
+  1060→      select: { id: true },
+  1061→    })
+  1062→  ) !== null;
+  1063→
+  1064→  const computed: { enrollmentId: string; average: number }[] = [];
+  1065→  for (const enrollment of enrollments) {
+  1066→    const marks = allMarks.filter((m) => m.enrollmentId === enrollment.id);
+  1067→    const outcome = computeForEnrollment(
+  1068→      marks.map((m) => ({ classSubjectId: m.classSubjectId, marks: m.marks })),
+  1069→      classSubjects.map((c) => ({ id: c.id, subjectId: c.subjectId })),
+  1070→      rules,
+  1071→      classroom.grade,
+  1072→      annualHeld,
+  1073→    );
+  1074→    for (const sr of outcome.subjectResults) {
+  1075→      const cs = classSubjects.find((c) => c.subjectId === sr.subjectId);
+  1076→      if (!cs) continue;
+  1077→      await db.subjectResult.upsert({
+  1078→        where: { enrollmentId_academicYearId_subjectId: { enrollmentId: enrollment.id, academicYearId: classroom.academicYearId, subjectId: sr.subjectId } },
+  1079→        create: {
+  1080→          academicYearId: classroom.academicYearId,
+  1081→          enrollmentId: enrollment.id,
+  1082→          subjectId: sr.subjectId,
+  1083→          total: sr.total,
+  1084→          grade: sr.grade,
+  1085→          passed: sr.passed,
+  1086→        },
+  1087→        update: { total: sr.total, grade: sr.grade, passed: sr.passed },
+  1088→      });
+  1089→    }
+  1090→    await db.studentAnnualSummary.upsert({
+  1091→      where: { enrollmentId_academicYearId: { enrollmentId: enrollment.id, academicYearId: classroom.academicYearId } },
+  1092→      create: {
+  1093→        academicYearId: classroom.academicYearId,
+  1094→        enrollmentId: enrollment.id,
+  1095→        total: outcome.total,
+  1096→        average: outcome.average,
+  1097→        rank: 0,
+  1098→        status: outcome.status,
+  1099→      },
+  1100→      update: { total: outcome.total, average: outcome.average, status: outcome.status },
+  1101→    });
+  1102→    computed.push({ enrollmentId: enrollment.id, average: outcome.average });
+  1103→  }
+  1104→
+  1105→  // Rank by average desc among active enrollments
+  1106→  computed.sort((a, b) => b.average - a.average);
+  1107→  for (let i = 0; i < computed.length; i++) {
+  1108→    await db.studentAnnualSummary.updateMany({
+  1109→      where: { enrollmentId: computed[i].enrollmentId, academicYearId: classroom.academicYearId },
+  1110→      data: { rank: i + 1 },
+  1111→    });
+  1112→  }
+  1113→  await audit(user.id, "compute", "Exam", id, { computed: computed.length });
+  1114→  return json({ computed: computed.length });
+  1115→}
+  1116→
+  1117→// ============================================================
+  1118→// REPORTS
+  1119→// ============================================================
+  1120→
+  1121→async function reportProfitLoss(q: URLSearchParams): Promise<NextResponse> {
+  1122→  const monthKey = q.get("monthKey") || currentMonthKey();
+  1123→  const r = monthRangeFor(monthKey);
+  1124→
+  1125→  const [feePayments, transportPayments, sales, expenses, salaryPayments] = await Promise.all([
+  1126→    db.feePayment.findMany({ where: { invoice: { monthKey } }, select: { amount: true } }),
+  1127→    db.transportPayment.findMany({ where: { monthKey }, select: { amount: true } }),
+  1128→    db.sale.findMany({ where: { date: { gte: r.start, lte: r.end } }, include: { item: { select: { type: true } } } }),
+  1129→    db.expense.findMany({ where: { date: { gte: r.start, lte: r.end } }, include: { category: { select: { name: true } } } }),
+  1130→    db.salaryPayment.findMany({ where: { monthKey, status: "پرداخت‌شده" }, select: { amount: true } }),
+  1131→  ]);
+  1132→
+  1133→  const fees = feePayments.reduce((s, p) => s + p.amount, 0);
+  1134→  const transport = transportPayments.reduce((s, p) => s + p.amount, 0);
+  1135→  let books = 0;
+  1136→  let uniforms = 0;
+  1137→  for (const sale of sales) {
+  1138→    if (sale.item.type === "یونیفورم") uniforms += sale.total;
+  1139→    else books += sale.total;
+  1140→  }
+  1141→  const byCategoryMap = new Map<string, number>();
+  1142→  for (const e of expenses) {
+  1143→    const name = e.category.name;
+  1144→    byCategoryMap.set(name, (byCategoryMap.get(name) ?? 0) + e.amount);
+  1145→  }
+  1146→  const byCategory = Array.from(byCategoryMap.entries()).map(([name, amount]) => ({ name, amount }));
+  1147→  const salaries = salaryPayments.reduce((s, p) => s + p.amount, 0);
+  1148→  const revenueTotal = fees + transport + books + uniforms;
+  1149→  const expenseTotal = byCategory.reduce((s, e) => s + e.amount, 0) + salaries;
+  1150→  return json({
+  1151→    monthKey,
+  1152→    revenues: { fees, transport, books, uniforms, total: revenueTotal },
+  1153→    expenses: { byCategory, salaries, total: expenseTotal },
+  1154→    net: revenueTotal - expenseTotal,
+  1155→  });
+  1156→}
+  1157→
+  1158→async function reportFees(q: URLSearchParams): Promise<NextResponse> {
+  1159→  const w = buildWhere("invoices", q);
+  1160→  const invoices = (await db.feeInvoice.findMany({
+  1161→    where: w,
+  1162→    include: INCLUDES.invoices,
+  1163→    orderBy: { createdAt: "desc" },
+  1164→  })) as Record<string, unknown>[];
+  1165→  const status = (q.get("status") || "").trim();
+  1166→  let items = invoices.map((inv) => ({
+  1167→    ...inv,
+  1168→    due: Math.max(0, (inv.amount as number) - ((inv.discount as number) ?? 0)),
+  1169→    remaining: Math.max(0, (inv.amount as number) - ((inv.discount as number) ?? 0) - ((inv.paidAmount as number) ?? 0)),
+  1170→    status: invoiceStatus(inv as never),
+  1171→  }));
+  1172→  if (status) items = items.filter((i) => i.status === status);
+  1173→  const totals = {
+  1174→    billed: items.reduce((s, i) => s + (i.amount as number), 0),
+  1175→    paid: items.reduce((s, i) => s + ((i.paidAmount as number) ?? 0), 0),
+  1176→    remaining: items.reduce((s, i) => s + (i.remaining as number), 0),
+  1177→  };
+  1178→  return json({ items, totals });
+  1179→}
+  1180→
+  1181→async function reportTransport(q: URLSearchParams): Promise<NextResponse> {
+  1182→  const monthKey = q.get("monthKey") || currentMonthKey();
+  1183→  const r = monthRangeFor(monthKey);
+  1184→  const payments = await db.transportPayment.findMany({
+  1185→    where: { monthKey },
+  1186→    include: {
+  1187→      transportEnrollment: {
+  1188→        include: {
+  1189→          student: { include: { enrollments: { include: { classroom: { select: { id: true, name: true } } } } } },
+  1190→        },
+  1191→      },
+  1192→    },
+  1193→  });
+  1194→  const expenses = await db.transportExpense.findMany({ where: { date: { gte: r.start, lte: r.end } }, orderBy: { date: "asc" } });
+  1195→  const revenue = payments.reduce((s, p) => s + p.amount, 0);
+  1196→  const expenseTotal = expenses.reduce((s, e) => s + e.amount, 0);
+  1197→  const perClassMap = new Map<string, number>();
+  1198→  for (const p of payments) {
+  1199→    const cls = p.transportEnrollment.student?.enrollments?.[0]?.classroom?.name ?? "—";
+  1200→    perClassMap.set(cls, (perClassMap.get(cls) ?? 0) + p.amount);
+  1201→  }
+  1202→  return json({
+  1203→    monthKey,
+  1204→    revenue,
+  1205→    expenses,
+  1206→    expenseTotal,
+  1207→    profit: revenue - expenseTotal,
+  1208→    perClass: Array.from(perClassMap.entries()).map(([className, revenue]) => ({ className, revenue })),
+  1209→  });
+  1210→}
+  1211→
+  1212→async function reportStore(q: URLSearchParams): Promise<NextResponse> {
+  1213→  const type = q.get("type") || "کتاب";
+  1214→  const [sales, purchases] = await Promise.all([
+  1215→    db.sale.findMany({ where: { item: { type } }, include: { item: { select: { id: true, name: true } } } }),
+  1216→    db.purchase.findMany({ where: { item: { type } }, select: { total: true } }),
+  1217→  ]);
+  1218→  const revenue = sales.reduce((s, x) => s + x.total, 0);
+  1219→  const purchaseTotal = purchases.reduce((s, x) => s + x.total, 0);
+  1220→  const byItemMap = new Map<string, { name: string; sold: number; revenue: number }>();
+  1221→  for (const sale of sales) {
+  1222→    const rec = byItemMap.get(sale.item.name) ?? { name: sale.item.name, sold: 0, revenue: 0 };
+  1223→    rec.sold += sale.qty;
+  1224→    rec.revenue += sale.total;
+  1225→    byItemMap.set(sale.item.name, rec);
+  1226→  }
+  1227→  return json({
+  1228→    type,
+  1229→    revenue,
+  1230→    purchases: purchaseTotal,
+  1231→    profit: revenue - purchaseTotal,
+  1232→    byItem: Array.from(byItemMap.values()),
+  1233→  });
+  1234→}
+  1235→
+  1236→async function reportAttendance(q: URLSearchParams): Promise<NextResponse> {
+  1237→  const monthKey = q.get("monthKey") || currentMonthKey();
+  1238→  const kind = q.get("kind") || "student";
+  1239→  const dates = jalaliMonthDates(monthKey);
+  1240→  if (dates.length === 0) return err("monthKey نامعتبر است");
+  1241→  const range = { gte: new Date(`${dates[0]}T00:00:00.000Z`), lte: new Date(`${dates[dates.length - 1]}T23:59:59.999Z`) };
+  1242→  if (kind === "staff") {
+  1243→    const staffList = await db.staff.findMany({ where: { status: "active" }, orderBy: { name: "asc" } });
+  1244→    const records = await db.staffAttendance.findMany({ where: { staffId: { in: staffList.map((s) => s.id) }, date: range } });
+  1245→    const items = staffList.map((s) => {
+  1246→      const mine = records.filter((r) => r.staffId === s.id);
+  1247→      const count = (st: string) => mine.filter((r) => r.status === st).length;
+  1248→      const total = mine.length;
+  1249→      const present = count("حاضر");
+  1250→      return {
+  1251→        id: s.id,
+  1252→        staffNo: s.staffNo,
+  1253→        name: s.name,
+  1254→        position: s.position,
+  1255→        present,
+  1256→        absent: count("غایب"),
+  1257→        leave: count("رخصتی"),
+  1258→        mission: count("ماموریت"),
+  1259→        total,
+  1260→        percent: total > 0 ? Math.round((present / total) * 1000) / 10 : 0,
+  1261→      };
+  1262→    });
+  1263→    return json({ monthKey, kind, items });
+  1264→  }
+  1265→  const enrollments = await db.enrollment.findMany({
+  1266→    where: { status: "active" },
+  1267→    include: {
+  1268→      student: { select: { id: true, studentNo: true, firstName: true, fatherName: true } },
+  1269→      classroom: { select: { id: true, name: true, grade: true } },
+  1270→    },
+  1271→  });
+  1272→  const records = await db.studentAttendance.findMany({
+  1273→    where: { enrollmentId: { in: enrollments.map((e) => e.id) }, date: range },
+  1274→  });
+  1275→  const items = enrollments.map((e) => {
+  1276→    const mine = records.filter((r) => r.enrollmentId === e.id);
+  1277→    const count = (st: string) => mine.filter((r) => r.status === st).length;
+  1278→    const total = mine.length;
+  1279→    const present = count("حاضر");
+  1280→    return {
+  1281→      id: e.id,
+  1282→      studentNo: e.student.studentNo,
+  1283→      name: e.student.firstName,
+  1284→      fatherName: e.student.fatherName,
+  1285→      classroom: e.classroom.name,
+  1286→      present,
+  1287→      absent: count("غایب"),
+  1288→      sick: count("مریض"),
+  1289→      leave: count("رخصتی"),
+  1290→      total,
+  1291→      percent: total > 0 ? Math.round((present / total) * 1000) / 10 : 0,
+  1292→    };
+  1293→  });
+  1294→  return json({ monthKey, kind, items });
+  1295→}
+  1296→
+  1297→// ============================================================
+  1298→// DASHBOARD
+  1299→// ============================================================
+  1300→
+  1301→async function dashboardHandler(): Promise<NextResponse> {
+  1302→  const year = await currentYear();
+  1303→  const todayIso = toISODate(new Date());
+  1304→  const today = new Date(`${todayIso}T00:00:00.000Z`);
+  1305→  const monthKey = currentMonthKey();
+  1306→
+  1307→  const [students, staff, todayRecords, monthPayments, monthInvoices, treasuryRows, recentPayments] = await Promise.all([
+  1308→    db.student.count({ where: { status: "active" } }),
+  1309→    db.staff.count({ where: { status: "active" } }),
+  1310→    db.studentAttendance.findMany({ where: { date: today }, select: { status: true } }),
+  1311→    db.feePayment.findMany({ where: { invoice: { monthKey } }, select: { amount: true } }),
+  1312→    db.feeInvoice.findMany({ where: { monthKey }, select: { amount: true, discount: true, paidAmount: true } }),
+  1313→    db.treasuryTransaction.findMany({ where: year ? { academicYearId: year.id } : {}, select: { type: true, amount: true } }),
+  1314→    db.feePayment.findMany({
+  1315→      orderBy: { date: "desc" },
+  1316→      take: 6,
+  1317→      include: {
+  1318→        invoice: {
+  1319→          include: {
+  1320→            enrollment: { include: { student: { select: { studentNo: true, firstName: true, fatherName: true } } } },
+  1321→            classroom: { select: { name: true } },
+  1322→          },
+  1323→        },
+  1324→      },
+  1325→    }),
+  1326→  ]);
+  1327→
+  1328→  const todayPresent = todayRecords.filter((r) => r.status === "حاضر").length;
+  1329→  const monthCollected = monthPayments.reduce((s, p) => s + p.amount, 0);
+  1330→  const monthRemaining = monthInvoices.reduce(
+  1331→    (s, inv) => s + Math.max(0, inv.amount - inv.discount - inv.paidAmount),
+  1332→    0,
+  1333→  );
+  1334→  let treasuryBalance = 0;
+  1335→  for (const t of treasuryRows) {
+  1336→    if (t.type === "دخل") treasuryBalance += t.amount;
+  1337→    else treasuryBalance -= t.amount; // تجری & بردگی
+  1338→  }
+  1339→
+  1340→  const months = lastMonthKeys(6);
+  1341→  const allPayments = await db.feePayment.findMany({
+  1342→    where: { invoice: { monthKey: { in: months } } },
+  1343→    select: { amount: true, invoice: { select: { monthKey: true } } },
+  1344→  });
+  1345→  const monthlyCollection = months.map((mk) => ({
+  1346→    monthKey: mk,
+  1347→    label: monthKeyLabel(mk),
+  1348→    amount: allPayments.filter((p) => p.invoice.monthKey === mk).reduce((s, p) => s + p.amount, 0),
+  1349→  }));
+  1350→
+  1351→  return json({
+  1352→    students,
+  1353→    staff,
+  1354→    todayPresent,
+  1355→    todayPresentPercent: todayRecords.length > 0 ? Math.round((todayPresent / todayRecords.length) * 1000) / 10 : 0,
+  1356→    monthKey,
+  1357→    monthCollected,
+  1358→    monthRemaining,
+  1359→    treasuryBalance,
+  1360→    recentPayments: recentPayments.map((p) => ({
+  1361→      id: p.id,
+  1362→      amount: p.amount,
+  1363→      date: p.date,
+  1364→      receiptNo: p.receiptNo,
+  1365→      studentName: `${p.invoice.enrollment.student.firstName} ${p.invoice.enrollment.student.fatherName}`,
+  1366→      studentNo: p.invoice.enrollment.student.studentNo,
+  1367→      classroom: p.invoice.classroom.name,
+  1368→    })),
+  1369→    monthlyCollection,
+  1370→  });
+  1371→}
+  1372→
+  1373→// ============================================================
+  1374→// NOTIFICATIONS
+  1375→// ============================================================
+  1376→
+  1377→function renderTemplate(body: string, vars: Record<string, string>): string {
+  1378→  let out = body;
+  1379→  for (const [k, v] of Object.entries(vars)) {
+  1380→    out = out.split(`{{${k}}}`).join(v);
+  1381→  }
+  1382→  return out;
+  1383→}
+  1384→
+  1385→async function notificationCreate(user: AuthUser, body: Record<string, unknown>): Promise<NextResponse> {
+  1386→  let category = String(body.category ?? "اطلاعیه");
+  1387→  const audience = String(body.audience ?? "والدین");
+  1388→  const templateKey = String(body.templateKey ?? "");
+  1389→  let baseBody = String(body.body ?? "");
+  1390→  if (templateKey && !baseBody) {
+  1391→    const tpl = await db.messageTemplate.findUnique({ where: { key: templateKey } });
+  1392→    if (tpl) {
+  1393→      baseBody = tpl.bodyDr;
+  1394→      if (!body.category) category = tpl.category;
+  1395→    }
+  1396→  }
+  1397→  if (!baseBody) return err("body یا templateKey لازم است");
+  1398→
+  1399→  const classroomId = body.classroomId ? String(body.classroomId) : null;
+  1400→  const studentId = body.studentId ? String(body.studentId) : null;
+  1401→  const staffId = body.staffId ? String(body.staffId) : null;
+  1402→  const phone = body.phone ? String(body.phone) : null;
+  1403→  const monthKey = String(body.monthKey ?? currentMonthKey());
+  1404→  const monthLabel = monthKeyLabel(monthKey);
+  1405→  const school = await db.school.findFirst();
+  1406→  const classroom = classroomId ? await db.classroom.findUnique({ where: { id: classroomId } }) : null;
+  1407→
+  1408→  // extra template vars optionally passed in the body (e.g. مبلغ)
+  1409→  const extraVars: Record<string, string> = {};
+  1410→  for (const k of ["مبلغ", "صنف", "مکتب"]) {
+  1411→    if (body[k]) extraVars[k] = String(body[k]);
+  1412→  }
+  1413→
+  1414→  const vars = (extra: Record<string, string> = {}) => ({
+  1415→    نام: extra["نام"] ?? "",
+  1416→    صنف: classroom?.name ?? extra["صنف"] ?? "",
+  1417→    مبلغ: extra["مبلغ"] ?? "",
+  1418→    ماه: monthLabel,
+  1419→    مکتب: school?.name ?? "مکتب خصوصی نداالقلم",
+  1420→    ...extraVars,
+  1421→    ...extra,
+  1422→  });
+  1423→
+  1424→  const created: unknown[] = [];
+  1425→
+  1426→  // fan-out: one notification per guardian phone of a classroom
+  1427→  if (audience === "والدین" && classroomId && !studentId && !phone) {
+  1428→    const enrollments = await db.enrollment.findMany({
+  1429→      where: { classroomId, status: "active" },
+  1430→      include: { student: true },
+  1431→    });
+  1432→    for (const e of enrollments) {
+  1433→      if (!e.student.guardianPhone) continue;
+  1434→      created.push(
+  1435→        await db.notification.create({
+  1436→          data: {
+  1437→            category,
+  1438→            audience,
+  1439→            studentId: e.studentId,
+  1440→            classroomId,
+  1441→            phone: e.student.guardianPhone,
+  1442→            body: renderTemplate(baseBody, vars({ نام: e.student.firstName })),
+  1443→            createdByUserId: user.id,
+  1444→          },
+  1445→        }),
+  1446→      );
+  1447→    }
+  1448→  } else if (audience === "کارمندان" && !staffId && !phone) {
+  1449→    const staffList = await db.staff.findMany({ where: { status: "active" } });
+  1450→    for (const s of staffList) {
+  1451→      if (!s.phone) continue;
+  1452→      created.push(
+  1453→        await db.notification.create({
+  1454→          data: { category, audience, staffId: s.id, phone: s.phone, body: renderTemplate(baseBody, vars({ نام: s.name })), createdByUserId: user.id },
+  1455→        }),
+  1456→      );
+  1457→    }
+  1458→  } else {
+  1459→    let rendered = baseBody;
+  1460→    if (studentId) {
+  1461→      const st = await db.student.findUnique({ where: { id: studentId } });
+  1462→      rendered = renderTemplate(baseBody, vars({ نام: st?.firstName ?? "", صنف: classroom?.name ?? "" }));
+  1463→    } else if (staffId) {
+  1464→      const s = await db.staff.findUnique({ where: { id: staffId } });
+  1465→      rendered = renderTemplate(baseBody, vars({ نام: s?.name ?? "" }));
+  1466→    } else {
+  1467→      rendered = renderTemplate(baseBody, vars());
+  1468→    }
+  1469→    created.push(
+  1470→      await db.notification.create({
+  1471→        data: {
+  1472→          category,
+  1473→          audience,
+  1474→          studentId,
+  1475→          staffId,
+  1476→          classroomId,
+  1477→          phone,
+  1478→          body: rendered,
+  1479→          createdByUserId: user.id,
+  1480→        },
+  1481→      }),
+  1482→    );
+  1483→  }
+  1484→  await audit(user.id, "create", "Notification", undefined, { count: created.length, category });
+  1485→  return json({ items: created, count: created.length, item: created[0] ?? null });
+  1486→}
+  1487→
+  1488→async function notificationSend(user: AuthUser, id: string): Promise<NextResponse> {
+  1489→  const item = await db.notification.findUnique({ where: { id } });
+  1490→  if (!item) return err("not found", 404);
+  1491→  const settings = await settingsObject();
+  1492→  const gatewayUrl = String(settings.smsGatewayUrl ?? "");
+  1493→  const apiKey = String(settings.smsApiKey ?? "");
+  1494→  if (!gatewayUrl || !apiKey || !item.phone) {
+  1495→    return json({ item }); // stays in صف
+  1496→  }
+  1497→  let okStatus = false;
+  1498→  try {
+  1499→    const res = await fetch(gatewayUrl, {
+  1500→      method: "POST",
+  1501→      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+  1502→      body: JSON.stringify({ phone: item.phone, body: item.body }),
+  1503→      signal: AbortSignal.timeout(10000),
+  1504→    });
+  1505→    okStatus = res.ok;
+  1506→  } catch {
+  1507→    okStatus = false;
+  1508→  }
+  1509→  const updated = await db.notification.update({
+  1510→    where: { id },
+  1511→    data: { status: okStatus ? "ارسال‌شده" : "ناکام", sentAt: okStatus ? new Date() : null },
+  1512→  });
+  1513→  await audit(user.id, "send", "Notification", id, { status: updated.status });
+  1514→  return json({ item: updated });
+  1515→}
+  1516→
+  1517→async function notificationExport(q: URLSearchParams): Promise<NextResponse> {
+  1518→  const w: Record<string, unknown> = {};
+  1519→  if (q.get("category")) w.category = q.get("category");
+  1520→  if (q.get("status")) w.status = q.get("status");
+  1521→  if (q.get("monthKey")) {
+  1522→    const r = monthRangeFor(q.get("monthKey") as string);
+  1523→    w.createdAt = { gte: r.start, lte: r.end };
+  1524→  }
+  1525→  const rows = await db.notification.findMany({ where: w, orderBy: { createdAt: "asc" } });
+  1526→  const csv = ["phone,body", ...rows.map((r) => `"${r.phone ?? ""}","${r.body.replace(/"/g, '""')}"`)].join("\n");
+  1527→  const stamp = q.get("monthKey") || toISODate(new Date());
+  1528→  return new NextResponse(csv, {
+  1529→    status: 200,
+  1530→    headers: {
+  1531→      "Content-Type": "text/csv; charset=utf-8",
+  1532→      "Content-Disposition": `attachment; filename="notifications-${stamp}.csv"`,
+  1533→    },
+  1534→  });
+  1535→}
+  1536→
+  1537→// ============================================================
+  1538→// BACKUP
+  1539→// ============================================================
+  1540→
+  1541→async function backupHandler(): Promise<NextResponse> {
+  1542→  const dump = {
+  1543→    exportedAt: new Date().toISOString(),
+  1544→    settings: await db.setting.findMany(),
+  1545→    school: await db.school.findMany(),
+  1546→    branches: await db.branch.findMany(),
+  1547→    academicYears: await db.academicYear.findMany(),
+  1548→    classrooms: await db.classroom.findMany(),
+  1549→    subjects: await db.subject.findMany(),
+  1550→    classSubjects: await db.classSubject.findMany(),
+  1551→    students: await db.student.findMany(),
+  1552→    enrollments: await db.enrollment.findMany(),
+  1553→    staff: await db.staff.findMany(),
+  1554→    staffDocuments: await db.staffDocument.findMany(),
+  1555→    studentAttendance: await db.studentAttendance.findMany(),
+  1556→    staffAttendance: await db.staffAttendance.findMany(),
+  1557→    feeStructures: await db.feeStructure.findMany(),
+  1558→    feeInvoices: await db.feeInvoice.findMany(),
+  1559→    feePayments: await db.feePayment.findMany(),
+  1560→    moneyHandovers: await db.moneyHandover.findMany(),
+  1561→    transportEnrollments: await db.transportEnrollment.findMany(),
+  1562→    transportPayments: await db.transportPayment.findMany(),
+  1563→    transportExpenses: await db.transportExpense.findMany(),
+  1564→    items: await db.item.findMany(),
+  1565→    purchases: await db.purchase.findMany(),
+  1566→    sales: await db.sale.findMany(),
+  1567→    expenseCategories: await db.expenseCategory.findMany(),
+  1568→    expenses: await db.expense.findMany(),
+  1569→    salaryPayments: await db.salaryPayment.findMany(),
+  1570→    exams: await db.exam.findMany(),
+  1571→    examMarks: await db.examMark.findMany(),
+  1572→    subjectResults: await db.subjectResult.findMany(),
+  1573→    studentAnnualSummaries: await db.studentAnnualSummary.findMany(),
+  1574→    notifications: await db.notification.findMany(),
+  1575→    messageTemplates: await db.messageTemplate.findMany(),
+  1576→    users: await db.user.findMany({ select: { id: true, username: true, fullName: true, role: true, active: true, phone: true, lastLoginAt: true, createdAt: true } }),
+  1577→    auditLogs: await db.auditLog.findMany({ take: 1000, orderBy: { createdAt: "desc" } }),
+  1578→    treasuryTransactions: await db.treasuryTransaction.findMany(),
+  1579→  };
+  1580→  const stamp = toISODate(new Date());
+  1581→  return new NextResponse(JSON.stringify(dump, null, 2), {
+  1582→    status: 200,
+  1583→    headers: {
+  1584→      "Content-Type": "application/json; charset=utf-8",
+  1585→      "Content-Disposition": `attachment; filename="neda-alqalam-backup-${stamp}.json"`,
+  1586→    },
+  1587→  });
+  1588→}
+  1589→
+  1590→// ============================================================
+  1591→// TREASURY / SALARIES
+  1592→// ============================================================
+  1593→
+  1594→async function treasuryWithdraw(user: AuthUser, body: Record<string, unknown>): Promise<NextResponse> {
+  1595→  const amount = num(body.amount);
+  1596→  if (amount <= 0) return err("amount لازم است");
+  1597→  const year = await currentYear();
+  1598→  if (!year) return err("سال تعلیمی تنظیم نشده", 400);
+  1599→  const date = dateOf(body.date);
+  1600→  const tx = await db.treasuryTransaction.create({
+  1601→    data: {
+  1602→      academicYearId: year.id,
+  1603→      type: "بردگی",
+  1604→      source: String(body.source ?? "دیگر"),
+  1605→      amount,
+  1606→      date,
+  1607→      description: body.description ? String(body.description) : null,
+  1608→      createdByUserId: user.id,
+  1609→    },
+  1610→  });
+  1611→  await moneyAudit(user.id, "TreasuryTransaction", tx.id, amount, { type: "بردگی" });
+  1612→  return json({ item: tx });
+  1613→}
+  1614→
+  1615→async function treasuryCreate(user: AuthUser, body: Record<string, unknown>): Promise<NextResponse> {
+  1616→  const amount = num(body.amount);
+  1617→  const type = String(body.type ?? "دخل");
+  1618→  if (amount <= 0 || !["دخل", "تجری", "بردگی"].includes(type)) return err("amount و type لازم است");
+  1619→  const year = await currentYear();
+  1620→  if (!year) return err("سال تعلیمی تنظیم نشده", 400);
+  1621→  const tx = await db.treasuryTransaction.create({
+  1622→    data: {
+  1623→      academicYearId: String(body.academicYearId ?? year.id),
+  1624→      type,
+  1625→      source: String(body.source ?? "دیگر"),
+  1626→      amount,
+  1627→      date: dateOf(body.date),
+  1628→      refModel: body.refModel ? String(body.refModel) : null,
+  1629→      refId: body.refId ? String(body.refId) : null,
+  1630→      description: body.description ? String(body.description) : null,
+  1631→      createdByUserId: user.id,
+  1632→    },
+  1633→  });
+  1634→  await moneyAudit(user.id, "TreasuryTransaction", tx.id, amount, { type });
+  1635→  return json({ item: tx });
+  1636→}
+  1637→
+  1638→async function salariesGenerate(user: AuthUser, body: Record<string, unknown>): Promise<NextResponse> {
+  1639→  const monthKey = String(body.monthKey ?? currentMonthKey());
+  1640→  const year = body.academicYearId ? { id: String(body.academicYearId) } : await currentYear();
+  1641→  if (!year) return err("سال تعلیمی تنظیم نشده", 400);
+  1642→  const staffList = await db.staff.findMany({ where: { status: "active" } });
+  1643→  let created = 0;
+  1644→  for (const s of staffList) {
+  1645→    const exists = await db.salaryPayment.findUnique({
+  1646→      where: { staffId_academicYearId_monthKey: { staffId: s.id, academicYearId: year.id, monthKey } },
+  1647→    });
+  1648→    if (exists) continue;
+  1649→    await db.salaryPayment.create({
+  1650→      data: { staffId: s.id, academicYearId: year.id, monthKey, amount: s.baseSalary },
+  1651→    });
+  1652→    created++;
+  1653→  }
+  1654→  await audit(user.id, "generate", "SalaryPayment", undefined, { monthKey, created });
+  1655→  return json({ created });
+  1656→}
+  1657→
+  1658→async function salaryPay(user: AuthUser, id: string, body: Record<string, unknown>): Promise<NextResponse> {
+  1659→  const salary = await db.salaryPayment.findUnique({ where: { id } });
+  1660→  if (!salary) return err("not found", 404);
+  1661→  const paidDate = dateOf(body.paidDate);
+  1662→  const item = await db.salaryPayment.update({
+  1663→    where: { id },
+  1664→    data: { status: "پرداخت‌شده", paidDate },
+  1665→  });
+  1666→  await addTreasury({
+  1667→    academicYearId: salary.academicYearId,
+  1668→    type: "تجری",
+  1669→    source: "معاشات",
+  1670→    amount: salary.amount,
+
+[showing lines 1031-1670 of 2259; use offset=1671 with limit to continue reading]

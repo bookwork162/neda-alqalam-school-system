@@ -1,0 +1,509 @@
+// مکتب خصوصی نداالقلم — Neda al-Qalam Private School
+// Prisma schema (SQLite) — Prisma 6
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============ Core / Config ============
+
+model Setting {
+  key   String @id
+  value String
+}
+
+model School {
+  id            String  @id @default(cuid())
+  name          String  @default("مکتب خصوصی نداالقلم")
+  nameEn        String  @default("Neda al-Qalam Private School")
+  licenseNo     String  @default("")
+  phone         String  @default("")
+  email         String  @default("")
+  address       String  @default("")
+  currentYearId String?
+
+  branches Branch[]
+}
+
+model Branch {
+  id       String  @id @default(cuid())
+  schoolId String
+  name     String
+  address  String?
+  school   School  @relation(fields: [schoolId], references: [id])
+}
+
+model AcademicYear {
+  id        String   @id @default(cuid())
+  name      String   @unique // "1405"
+  startDate DateTime
+  endDate   DateTime
+  isCurrent Boolean  @default(false)
+
+  classrooms      Classroom[]
+  enrollments     Enrollment[]
+  feeStructures   FeeStructure[]
+  invoices        FeeInvoice[]
+  handovers       MoneyHandover[]
+  transport       TransportEnrollment[]
+  salaries        SalaryPayment[]
+  exams           Exam[]
+  subjectResults  SubjectResult[]
+  annualSummaries StudentAnnualSummary[]
+  treasury        TreasuryTransaction[]
+}
+
+model Classroom {
+  id              String  @id @default(cuid())
+  academicYearId  String
+  grade           Int // 1..12
+  section         String  @default("الف")
+  name            String // "صنف ششم - الف"
+  level           String  @default("ابتدائیه") // ابتدائیه / متوسطه / لیسه
+  homeroomStaffId String?
+  academicYear    AcademicYear @relation(fields: [academicYearId], references: [id])
+  homeroomStaff   Staff?       @relation("Homeroom", fields: [homeroomStaffId], references: [id])
+
+  classSubjects ClassSubject[]
+  enrollments   Enrollment[]
+  exams         Exam[]
+  invoices      FeeInvoice[]
+  notifications Notification[]
+
+  @@unique([academicYearId, grade, section])
+}
+
+model Subject {
+  id     String @id @default(cuid())
+  nameDr String
+  namePs String
+  nameEn String
+
+  classSubjects ClassSubject[]
+  results       SubjectResult[]
+}
+
+model ClassSubject {
+  id          String  @id @default(cuid())
+  classroomId String
+  subjectId   String
+  staffId     String?
+  classroom   Classroom @relation(fields: [classroomId], references: [id])
+  subject     Subject   @relation(fields: [subjectId], references: [id])
+  staff       Staff?    @relation(fields: [staffId], references: [id])
+
+  examMarks ExamMark[]
+
+  @@unique([classroomId, subjectId])
+}
+
+// ============ People ============
+
+model Student {
+  id               String   @id @default(cuid())
+  studentNo        String   @unique // "1405-0001"
+  firstName        String
+  fatherName       String
+  grandFatherName  String?
+  tash             String? // قومیت
+  gender           String   @default("ذکور") // ذکور / اناث
+  birthDateJalali  String? // "1392-03-15"
+  birthProvince    String?
+  birthDistrict    String?
+  province         String?
+  district         String?
+  village          String?
+  address          String?
+  tazkiraNo        String?
+  guardianName     String?
+  guardianRelation String?
+  guardianPhone    String?
+  photoUrl         String?
+  previousSchool   String?
+  notes            String?
+  status           String   @default("active") // active / left / graduated
+  createdAt        DateTime @default(now())
+
+  enrollments       Enrollment[]
+  transport         TransportEnrollment[]
+  sales             Sale[]
+  notifications     Notification[]
+}
+
+model Enrollment {
+  id             String   @id @default(cuid())
+  studentId      String
+  classroomId    String
+  academicYearId String
+  rollNo         Int
+  enrolledAt     DateTime @default(now())
+  status         String   @default("active") // active / completed / transferred
+  uniformItems   String? // JSON array e.g. ["پیراهن","تنبان","سرپوش"]
+  student        Student      @relation(fields: [studentId], references: [id])
+  classroom      Classroom    @relation(fields: [classroomId], references: [id])
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id])
+
+  attendances    StudentAttendance[]
+  invoices       FeeInvoice[]
+  examMarks      ExamMark[]
+  subjectResults SubjectResult[]
+  annualSummary  StudentAnnualSummary[]
+
+  @@unique([studentId, academicYearId])
+}
+
+model Staff {
+  id              String   @id @default(cuid())
+  staffNo         String   @unique
+  name            String
+  fatherName      String?
+  position        String   @default("معلم") // معلم / اداری / خدمات
+  subjectSpecialty String?
+  educationDegree String?
+  tazkiraNo       String?
+  phone           String?
+  hireDate        DateTime
+  baseSalary      Float
+  photoUrl        String?
+  status          String   @default("active") // active / left
+  createdAt       DateTime @default(now())
+
+  documents        StaffDocument[]
+  attendances      StaffAttendance[]
+  salaries         SalaryPayment[]
+  classSubjects    ClassSubject[]
+  homeroomOf       Classroom[] @relation("Homeroom")
+  notifications    Notification[]
+}
+
+model StaffDocument {
+  id       String @id @default(cuid())
+  staffId  String
+  title    String
+  fileName String?
+  note     String?
+  staff    Staff  @relation(fields: [staffId], references: [id], onDelete: Cascade)
+}
+
+// ============ Attendance ============
+
+model StudentAttendance {
+  id           String   @id @default(cuid())
+  enrollmentId String
+  date         DateTime
+  status       String   @default("حاضر") // حاضر / غایب / مریض / رخصتی
+  note         String?
+  enrollment   Enrollment @relation(fields: [enrollmentId], references: [id])
+
+  @@unique([enrollmentId, date])
+}
+
+model StaffAttendance {
+  id     String   @id @default(cuid())
+  staffId String
+  date   DateTime
+  status String   @default("حاضر") // حاضر / غایب / رخصتی / ماموریت
+  staff  Staff    @relation(fields: [staffId], references: [id])
+
+  @@unique([staffId, date])
+}
+
+// ============ Fees ============
+
+model FeeStructure {
+  id             String @id @default(cuid())
+  academicYearId String
+  gradeBand      String // "1-3" / "4-6" / "7-9" / "10-12"
+  monthlyAmount  Float
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id])
+
+  @@unique([academicYearId, gradeBand])
+}
+
+model FeeInvoice {
+  id             String   @id @default(cuid())
+  enrollmentId   String
+  classroomId    String
+  academicYearId String
+  monthKey       String // "1405-08"
+  amount         Float
+  discount       Float    @default(0)
+  paidAmount     Float    @default(0)
+  note           String?
+  createdAt      DateTime @default(now())
+  enrollment   Enrollment  @relation(fields: [enrollmentId], references: [id])
+  classroom    Classroom   @relation(fields: [classroomId], references: [id])
+  academicYear AcademicYear @relation(fields: [academicYearId], references: [id])
+  payments     FeePayment[]
+
+  @@unique([enrollmentId, monthKey])
+}
+
+model FeePayment {
+  id              String   @id @default(cuid())
+  invoiceId       String
+  amount          Float
+  date            DateTime
+  method          String   @default("نقدی") // نقدی / بانکی
+  receiptNo       String   @unique // "RS-1405-0001"
+  createdByUserId String?
+  note            String?
+  invoice         FeeInvoice @relation(fields: [invoiceId], references: [id])
+
+  @@index([invoiceId])
+}
+
+model MoneyHandover {
+  id              String     @id @default(cuid())
+  academicYearId  String
+  periodFrom      String // jalali monthKey "1405-07"
+  periodTo        String
+  amount          Float
+  receiptNo       String     @unique // "HT-1405-0001"
+  createdByUserId String?
+  status          String     @default("در انتظار") // در انتظار / تسلیم‌شده
+  confirmedAt     DateTime?
+  note            String?
+  createdAt       DateTime   @default(now())
+  academicYear    AcademicYear @relation(fields: [academicYearId], references: [id])
+}
+
+// ============ Transport ============
+
+model TransportEnrollment {
+  id                    String  @id @default(cuid())
+  studentId             String
+  academicYearId        String
+  routeName             String?
+  monthlyFee            Float
+  active                Boolean @default(true)
+  student               Student      @relation(fields: [studentId], references: [id])
+  academicYear          AcademicYear @relation(fields: [academicYearId], references: [id])
+  payments              TransportPayment[]
+
+  @@unique([studentId, academicYearId])
+}
+
+model TransportPayment {
+  id                    String   @id @default(cuid())
+  transportEnrollmentId String
+  monthKey              String
+  amount                Float
+  date                  DateTime
+  receiptNo             String   @unique
+  transportEnrollment   TransportEnrollment @relation(fields: [transportEnrollmentId], references: [id])
+
+  @@unique([transportEnrollmentId, monthKey])
+}
+
+model TransportExpense {
+  id       String   @id @default(cuid())
+  date     DateTime
+  category String   @default("سوخت") // سوخت / تعمیرات / معاش راننده / دیگر
+  amount   Float
+  note     String?
+}
+
+// ============ Store (books & uniforms) ============
+
+model Item {
+  id            String @id @default(cuid())
+  type          String @default("کتاب") // کتاب / یونیفورم
+  name          String
+  size          String?
+  purchasePrice Float
+  salePrice     Float
+  stockQty      Int
+  purchases     Purchase[]
+  sales         Sale[]
+}
+
+model Purchase {
+  id        String   @id @default(cuid())
+  itemId    String
+  qty       Int
+  unitPrice Float
+  total     Float
+  date      DateTime
+  supplier  String?
+  note      String?
+  item      Item     @relation(fields: [itemId], references: [id])
+}
+
+model Sale {
+  id        String   @id @default(cuid())
+  studentId String?
+  itemId    String
+  qty       Int
+  unitPrice Float
+  total     Float
+  date      DateTime
+  receiptNo String   @unique
+  student   Student? @relation(fields: [studentId], references: [id])
+  item      Item     @relation(fields: [itemId], references: [id])
+}
+
+// ============ Expenses ============
+
+model ExpenseCategory {
+  id       String    @id @default(cuid())
+  name     String    @unique
+  expenses Expense[]
+}
+
+model Expense {
+  id              String   @id @default(cuid())
+  categoryId      String
+  amount          Float
+  date            DateTime
+  description     String?
+  voucherNo       String?
+  createdByUserId String?
+  category        ExpenseCategory @relation(fields: [categoryId], references: [id])
+}
+
+// ============ Salaries ============
+
+model SalaryPayment {
+  id             String    @id @default(cuid())
+  staffId        String
+  academicYearId String
+  monthKey       String
+  amount         Float
+  paidDate       DateTime?
+  status         String    @default("پرداخت‌نشده") // پرداخت‌شده / پرداخت‌نشده
+  staff          Staff        @relation(fields: [staffId], references: [id])
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id])
+
+  @@unique([staffId, academicYearId, monthKey])
+}
+
+// ============ Exams & Results ============
+
+model Exam {
+  id             String   @id @default(cuid())
+  academicYearId String
+  type           String // چهارونیم‌ماهه / سالانه / دو ماهه اول / دو ماهه دوم
+  label          String
+  maxPerSubject  Float
+  classroomId    String
+  examDate       DateTime
+  status         String   @default("برنامه‌ریزی‌شده") // برنامه‌ریزی‌شده / برگزارشده
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id])
+  classroom      Classroom    @relation(fields: [classroomId], references: [id])
+  marks          ExamMark[]
+}
+
+model ExamMark {
+  id             String @id @default(cuid())
+  examId         String
+  enrollmentId   String
+  classSubjectId String
+  marks          Float
+  exam           Exam        @relation(fields: [examId], references: [id])
+  enrollment     Enrollment  @relation(fields: [enrollmentId], references: [id])
+  classSubject   ClassSubject @relation(fields: [classSubjectId], references: [id])
+
+  @@unique([examId, enrollmentId, classSubjectId])
+}
+
+model SubjectResult {
+  id             String  @id @default(cuid())
+  academicYearId String
+  enrollmentId   String
+  subjectId      String
+  total          Float // annual out of 100 (40 + 60)
+  grade          String // عالی / خوب / قابل / مردود
+  passed         Boolean
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id])
+  enrollment     Enrollment   @relation(fields: [enrollmentId], references: [id])
+  subject        Subject      @relation(fields: [subjectId], references: [id])
+
+  @@unique([enrollmentId, academicYearId, subjectId])
+}
+
+model StudentAnnualSummary {
+  id             String  @id @default(cuid())
+  academicYearId String
+  enrollmentId   String
+  total          Float
+  average        Float
+  rank           Int
+  status         String  @default("در جریان") // ارتقا / ارتقا مشروط / تکرار صنف / در جریان
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id])
+  enrollment     Enrollment   @relation(fields: [enrollmentId], references: [id])
+
+  @@unique([enrollmentId, academicYearId])
+}
+
+// ============ Notifications & Templates ============
+
+model Notification {
+  id              String    @id @default(cuid())
+  category        String    @default("اطلاعیه") // حاضری / فیس / امتحان / اطلاعیه / معاش
+  audience        String    @default("والدین") // والدین / کارمندان
+  studentId       String?
+  staffId         String?
+  classroomId     String?
+  phone           String?
+  body            String
+  status          String    @default("صف") // صف / ارسال‌شده / ناکام
+  sentAt          DateTime?
+  createdByUserId String?
+  createdAt       DateTime  @default(now())
+  student         Student?  @relation(fields: [studentId], references: [id])
+  staff           Staff?    @relation(fields: [staffId], references: [id])
+  classroom       Classroom? @relation(fields: [classroomId], references: [id])
+}
+
+model MessageTemplate {
+  id       String @id @default(cuid())
+  key      String @unique
+  category String @default("اطلاعیه")
+  bodyDr   String
+  bodyPs   String
+  bodyEn   String
+}
+
+// ============ Users, Audit & Treasury ============
+
+model User {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  passwordHash String // "salt:hash" scrypt via node:crypto
+  fullName     String
+  role         String    @default("STAFF") // ADMIN / OWNER / FINANCE / TEACHER / STAFF
+  phone        String?
+  active       Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String
+  entity    String
+  entityId  String?
+  detail    String? // JSON string
+  createdAt DateTime @default(now())
+}
+
+model TreasuryTransaction {
+  id              String   @id @default(cuid())
+  academicYearId  String
+  type            String // دخل / تجری / بردگی
+  source          String // فیس / ترانسپورت / کتاب / یونیفورم / مصارف / معاشات / تسلیمی / دیگر
+  amount          Float
+  date            DateTime
+  refModel        String?
+  refId           String?
+  description     String?
+  createdByUserId String?
+  academicYear    AcademicYear @relation(fields: [academicYearId], references: [id])
+}
